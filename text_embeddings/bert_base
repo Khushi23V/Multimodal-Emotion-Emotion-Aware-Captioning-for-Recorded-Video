@@ -1,0 +1,114 @@
+# Bert-Base
+
+import os
+import math
+import pandas as pd
+import numpy as np
+from tqdm.auto import tqdm
+import joblib
+import torch
+from transformers import AutoTokenizer, AutoModel
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+
+train = pd.read_csv("train_sent_emo.csv")
+dev = pd.read_csv("dev_sent_emo.csv")
+test = pd.read_csv("test_sent_emo.csv")
+
+datasets = {"train": train, "dev": dev, "test": test}
+
+CSV_PATHS = {
+    "train": "train_sent_emo.csv",
+    "dev":   "dev_sent_emo.csv",
+    "test":  "test_sent_emo.csv",
+}
+
+SAVE_DIR = "bert_text_embeddings"
+MODEL_NAME = "bert-base-uncased"
+BATCH_SIZE = 32          
+MAX_LENGTH = 128      
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+os.makedirs(SAVE_DIR, exist_ok=True)
+print("Device:", DEVICE)
+
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModel.from_pretrained(MODEL_NAME)
+model.to(DEVICE)
+model.eval()
+
+def find_columns(df):
+    cols = {c.lower(): c for c in df.columns}
+    get = lambda *opts: next((cols[o] for o in opts if o in cols), None)
+    utter_col = get("utterance", "utterances", "text")
+    dialog_col = get("dialogue_id", "dialogue", "dialog_id")
+    uttid_col = get("utterance_id", "utt_id", "utter_id", "utteridx", "utterance_number", "utt_num")
+    return utter_col, dialog_col, uttid_col
+
+def mean_pooling(token_embeddings, attention_mask):
+    input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+    sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, dim=1)
+    sum_mask = input_mask_expanded.sum(dim=1).clamp(min=1e-9)
+    return sum_embeddings / sum_mask
+
+@torch.no_grad()
+def embed_texts(texts, batch_size=32):
+    all_embs = []
+    n = len(texts)
+    for i in range(0, n, batch_size):
+        batch_texts = texts[i:i+batch_size]
+        enc = tokenizer(batch_texts,
+                        padding=True,
+                        truncation=True,
+                        max_length=MAX_LENGTH,
+                        return_tensors="pt")
+        input_ids = enc["input_ids"].to(DEVICE)
+        attention_mask = enc["attention_mask"].to(DEVICE)
+
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
+        last_hidden = outputs.last_hidden_state  # (batch, seq_len, dim)
+        pooled = mean_pooling(last_hidden, attention_mask)  # (batch, dim)
+        pooled = pooled.cpu().numpy()
+        all_embs.append(pooled)
+    if len(all_embs) == 0:
+        return np.zeros((0, model.config.hidden_size), dtype=np.float32)
+    return np.vstack(all_embs).astype(np.float32)
+
+for split, csv_path in CSV_PATHS.items():
+    print(f"\nProcessing split: {split}  file: {csv_path}")
+    df = pd.read_csv(csv_path)
+    utter_col, dialog_col, uttid_col = find_columns(df)
+    if utter_col is None:
+        raise ValueError(f"Could not find Utterance column in {csv_path}. Columns: {df.columns.tolist()}")
+
+    df[utter_col] = df[utter_col].astype(str).str.strip()
+    df = df[df[utter_col] != ""].copy()
+    df = df.dropna(subset=[utter_col])
+    
+    ids = []
+    texts = []
+    for idx, row in df.iterrows():
+        if dialog_col is not None and uttid_col is not None and pd.notna(row[dialog_col]) and pd.notna(row[uttid_col]):
+            id_ = f"{int(row[dialog_col])}_{int(row[uttid_col])}"
+        else:
+            id_ = f"row_{idx}"
+        ids.append(id_)
+        texts.append(str(row[utter_col]))
+
+    print(f"Total utterances to embed: {len(texts)}")
+
+    embs = embed_texts(texts, batch_size=BATCH_SIZE)
+    print("Embeddings shape:", embs.shape)  # (N, hidden_size)
+
+    emb_dict = {ids[i]: embs[i] for i in range(len(ids))}
+
+    pkl_path = os.path.join(SAVE_DIR, f"{split}_bert_base_embs.pkl")
+    npy_path = os.path.join(SAVE_DIR, f"{split}_bert_base_embs.npy")
+    map_csv = os.path.join(SAVE_DIR, f"{split}_mapping.csv")
+
+    joblib.dump(emb_dict, pkl_path)
+    np.save(npy_path, embs)
+    pd.DataFrame({"id": ids, "text": texts}).to_csv(map_csv, index=False)
+
+    print(f"Saved: {pkl_path}  {npy_path}  {map_csv}")
